@@ -1,0 +1,6 @@
+This is a simple polling dispatcher. I use it in other projects and this
+is just where the most up to date version is meant to reside to avoid
+confusion.
+
+As it stands this is just the code. Tests and other useful stuff might
+arrive later but I wouldn't hold your breath.
