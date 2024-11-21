@@ -334,6 +334,10 @@ static void *poll_thread(void *v)
             rv = poll(a, npoll + (a[npoll].fd != -1), timeout);
         } while (rv == -1 && errno == EINTR);
 
+        // Only do timeouts if nothing polled
+        if (rv > 0)
+            timeout0 = 0;
+
         if (prepost.post)
             prepost.post(prepost.v, a[npoll].revents);
 
