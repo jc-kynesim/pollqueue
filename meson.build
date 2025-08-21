@@ -1,4 +1,9 @@
-project('pollqueue', 'c')
+project('pollqueue', 'c',
+	default_options: ['warning_level=3',
+		'werror=true',
+		'buildtype=debugoptimized',
+		'default_library=static']
+)
 
 pollqueue_deps = [ dependency('threads') ]
 
@@ -13,3 +18,5 @@ pollqueue_dep = declare_dependency(
 	include_directories : [ include_directories('.') ])
 
 meson.override_dependency('pollqueue', pollqueue_dep)
+
+subdir('test')
