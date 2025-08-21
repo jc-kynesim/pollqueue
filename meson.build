@@ -19,4 +19,6 @@ pollqueue_dep = declare_dependency(
 
 meson.override_dependency('pollqueue', pollqueue_dep)
 
-subdir('test')
+if not meson.is_subproject()
+    subdir('test')
+endif

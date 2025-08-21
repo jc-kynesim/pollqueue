@@ -5,7 +5,6 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
