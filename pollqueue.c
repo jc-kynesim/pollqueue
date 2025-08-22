@@ -25,9 +25,16 @@ enum polltask_state {
     POLLTASK_Q_KILL,
     POLLTASK_Q_DEAD,
     POLLTASK_RUN_KILL,
+    POLLTASK_EXIT,
 };
 
-#define POLLTASK_FLAG_ONCE 1
+// Run this task once and auto delete it once run
+#define POLLTASK_FLAG_ONCE      1
+// This polltask does not keep a ref to its Q
+// This means that it does not block queue deletion and will run on thread
+// exit with revents = -1. Caller is reponsible for ensuring that the queue
+// is valid for the duration of the tasks existence.
+#define POLLTASK_FLAG_NO_REF    2
 
 struct polltask {
     struct polltask *next;
@@ -93,7 +100,7 @@ polltask_new2(struct pollqueue *const pq,
     *pt = (struct polltask){
         .next = NULL,
         .prev = NULL,
-        .q = pollqueue_ref(pq),
+        .q = (flags & POLLTASK_FLAG_NO_REF) != 0 ? pq : pollqueue_ref(pq),
         .fd = fd,
         .events = events,
         .flags = flags,
@@ -153,7 +160,7 @@ static void polltask_free(struct polltask * const pt)
 
 static void polltask_kill(struct polltask * const pt)
 {
-    struct pollqueue * pq = pt->q;
+    struct pollqueue * pq = (pt->flags & POLLTASK_FLAG_NO_REF) != 0 ? NULL : pt->q;
     polltask_free(pt);
     pollqueue_unref(&pq);
 }
@@ -395,14 +402,17 @@ static void *poll_thread(void *v)
 
     } while (!pq->kill);
 
+    {
+        struct polltask * pt;
+        for (pt = pq->head; pt != NULL; pt = pt->next)
+            pt->state = POLLTASK_EXIT;
+    }
     pthread_mutex_unlock(&pq->lock);
 fail_unlocked:
 
     {
-        void (*const exit_fn)(void *v) = pq->exit_fn;
-        void * const exit_v = pq->exit_v;
+        struct polltask *pt = pq->head;
 
-        polltask_free(pq->prod_pt);
         pthread_cond_destroy(&pq->cond);
         pthread_mutex_destroy(&pq->lock);
         close(pq->prod_fd);
@@ -410,8 +420,14 @@ fail_unlocked:
             pthread_detach(pthread_self());
         free(pq);
 
-        if (exit_fn)
-            exit_fn(exit_v);
+        // **** Think harder about freeing non-single use PTs
+        // prod may be special?
+        while (pt != NULL) {
+            struct polltask * const next = pt->next;
+            pt->fn(pt->v, -1);
+            polltask_free(pt);
+            pt = next;
+        }
     }
 
     return NULL;
@@ -421,15 +437,16 @@ static void prod_fn(void *v, short revents)
 {
     struct pollqueue *const pq = v;
     char buf[8];
-    if (revents) {
+    if (revents == -1)
+        return;
+    if (revents != 0) {
         int rv;
         while ((rv = read(pq->prod_fd, buf, 8)) != 8) {
             if (!(rv == -1 && errno == EINTR))
                 break;
         }
     }
-    if (!pq->kill)
-        pollqueue_add_task(pq->prod_pt, -1);
+    pollqueue_add_task(pq->prod_pt, -1);
 }
 
 struct pollqueue * pollqueue_new(void)
@@ -450,14 +467,12 @@ struct pollqueue * pollqueue_new(void)
     pq->prod_fd = eventfd(0, EFD_NONBLOCK);
     if (pq->prod_fd == -1)
         goto fail1;
-    pq->prod_pt = polltask_new(pq, pq->prod_fd, POLLIN, prod_fn, pq);
+    pq->prod_pt = polltask_new2(pq, pq->prod_fd, POLLIN, prod_fn, pq, POLLTASK_FLAG_NO_REF);
     if (!pq->prod_pt)
         goto fail2;
     pollqueue_add_task(pq->prod_pt, -1);
     if (pthread_create(&pq->worker, NULL, poll_thread, pq))
         goto fail3;
-    // Reset ref count which will have been inced by the add_task
-    atomic_store(&pq->ref_count, 0);
     return pq;
 
 fail3:
@@ -553,9 +568,44 @@ void pollqueue_set_pre_post(struct pollqueue *const pq,
     pthread_mutex_unlock(&pq->lock);
 }
 
+//----------------------------------------------------------------------------
+//
+// On exit fn
+// Would have been simpler if it took a standard callback
+
+struct exit_env_ss {
+    void (* fn)(void * v);
+    void * v;
+};
+
+static void exit_cb(void * v, short revents)
+{
+    struct exit_env_ss * ee = v;
+    assert(revents == -1);
+
+    ee->fn(ee->v);
+    free(ee);
+}
+
 void pollqueue_set_exit(struct pollqueue *const pq,
                         void (* const exit_fn)(void * v), void * v)
 {
-    pq->exit_fn = exit_fn;
-    pq->exit_v = v;
+    struct exit_env_ss * ee = malloc(sizeof(*ee));
+    struct polltask * pt;
+
+    if (ee == NULL)
+        return;
+
+    ee->fn = exit_fn;
+    ee->v = v;
+
+    pt = polltask_new2(pq, -1, 0, exit_cb, ee, POLLTASK_FLAG_ONCE | POLLTASK_FLAG_NO_REF);
+    if (pt == NULL)
+        goto fail;
+
+    pollqueue_add_task(pt, -1);
+    return;
+
+fail:
+    free(ee);
 }
