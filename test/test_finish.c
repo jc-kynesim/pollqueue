@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <inttypes.h>
 #include <semaphore.h>
 #include <stdbool.h>
@@ -214,6 +215,69 @@ test4()
 
 //----------------------------------------------------------------------------
 
+static void
+test5_cb(void *v, short revents)
+{
+	(void)v;
+	assert(revents == 0);
+}
+
+static int
+test5()
+{
+	struct pollqueue * pq;
+	uint64_t now;
+	uint64_t delta;
+	int t;
+	int rv = 0;
+	printf("Test5: finish_timeout\n");
+
+	pq = pollqueue_new();
+	if (pq == NULL) {
+		printf("Pollqueue create failed\n");
+		return 1;
+	}
+	now = time_ms();
+	pollqueue_timer_once(pq, test5_cb, NULL, 1000);
+	t = pollqueue_finish_timeout(&pq, 0);
+	if (t != 1) {
+		printf("First finish did not timeout (0)\n");
+		rv = 1;
+	}
+	t = pollqueue_finish_timeout(&pq, 500);
+	if (t != 1) {
+		printf("Second finish did not timeout (500)\n");
+		rv = 1;
+	}
+	delta = time_ms() - now;
+	printf("Delta to finish 2 = %" PRId64 "ms\n", delta);
+	if (delta < 490 || delta > 650) {
+		printf("Delta out of range - should be 500 (allow 490-650)");
+		rv = 1;
+	}
+	t = pollqueue_finish_timeout(&pq, 1000);
+	if (t != 0) {
+		printf("Third finish timedout (1000)\n");
+		rv = 1;
+	}
+	delta = time_ms() - now;
+	printf("Delta to finish 3 = %" PRId64 "ms\n", delta);
+	if (delta < 990 || delta > 1100) {
+		printf("Delta out of range - should be 1000 (allow 990-1100)");
+		rv = 1;
+	}
+
+	if (pq != NULL) {
+		printf("PQ not NULL after finish\n");
+		return 1;
+	}
+	printf(rv ? "FAIL\n" : "OK\n");
+	return 0;
+}
+
+
+//----------------------------------------------------------------------------
+
 int
 main(int argc, char *argv[])
 {
@@ -225,7 +289,12 @@ main(int argc, char *argv[])
 	fail_count += test2();
 	fail_count += test3();
 	fail_count += test4();
+	fail_count += test5();
 
+	if (fail_count)
+		printf("Tests failed: %d\n", fail_count);
+	else
+		printf("All tests OK\n");
 	return fail_count;
 }
 

@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -69,8 +70,12 @@ struct pollqueue {
     void (* exit_fn)(void * v);
     void * exit_v;
 
+    // On thread exit do not detach - counted value allows us to cope with
+    // multiple simultainious finish calls. Only poked from poll_thread so
+    // no need to lock.
+    int join_req;
+
     bool kill;
-    bool join_req;  // On thread exit do not detach
     bool no_prod;
 
     bool sig_seq; // Signal cond when seq incremented
@@ -127,16 +132,24 @@ struct polltask *polltask_new_timer(struct pollqueue *const pq,
     return polltask_new(pq, -1, 0, fn, v);
 }
 
+int pollqueue_timer_once(struct pollqueue *const pq,
+                         void (*const fn)(void *v, short revents),
+                         void *const v,
+                         const int timeout_ms)
+{
+    struct polltask * const pt = polltask_new2(pq, -1, 0, fn, v, POLLTASK_FLAG_ONCE);
+    if (pt == NULL)
+        return -EINVAL;
+    pollqueue_add_task(pt, timeout_ms);
+    return 0;
+}
+
 int
 pollqueue_callback_once(struct pollqueue *const pq,
                         void (*const fn)(void *v, short revents),
                         void *const v)
 {
-    struct polltask * const pt = polltask_new2(pq, -1, 0, fn, v, POLLTASK_FLAG_ONCE);
-    if (pt == NULL)
-        return -EINVAL;
-    pollqueue_add_task(pt, 0);
-    return 0;
+    return pollqueue_timer_once(pq, fn, v, 0);
 }
 
 static void pollqueue_rem_task(struct pollqueue *const pq, struct polltask *const pt)
@@ -416,7 +429,7 @@ fail_unlocked:
         pthread_cond_destroy(&pq->cond);
         pthread_mutex_destroy(&pq->lock);
         close(pq->prod_fd);
-        if (!pq->join_req)
+        if (!pq->join_req != 0)
             pthread_detach(pthread_self());
         free(pq);
 
@@ -523,25 +536,117 @@ void pollqueue_unref(struct pollqueue **const ppq)
     pollqueue_free(pq);
 }
 
-void pollqueue_finish(struct pollqueue **const ppq)
+//----------------------------------------------------------------------------
+//
+// Finish code.
+// Most of the complexity is in ensuring that timeouts are raceless
+// Try to keep everything that might error in the calling thread so
+// the error can be signalled easily
+
+struct finish_timeout_ss {
+    bool timed_out;
+    int timeout_ms;
+    struct pollqueue * pq;
+    struct polltask * pt;
+    sem_t sem;
+};
+
+// Inc ref_count iff it hasn't gone -ve i.e. _free has not been called
+// If we inc from -ve then there is always a race that might end up with
+// freeing twice
+static bool
+unfinish(struct pollqueue * const pq)
+{
+    int n = atomic_load(&pq->ref_count);
+    while (n >= 0 && !atomic_compare_exchange_weak(&pq->ref_count, &n, n + 1))
+        /* loop */;
+    return n >= 0;
+}
+
+static void
+finish_timeout_cb2(void *v, short revents)
+{
+    struct finish_timeout_ss * const ft = v;
+    struct pollqueue * const pq = ft->pq;
+
+    if (revents != -1 && unfinish(pq))
+    {
+        --pq->join_req;
+        ft->timed_out = true;
+    }
+
+    sem_post(&ft->sem);
+}
+
+static void
+finish_timeout_cb1(void *v, short revents)
+{
+    struct finish_timeout_ss * const ft = v;
+    struct pollqueue * pq = ft->pq;
+    (void)revents;
+
+    ++pq->join_req;
+    pollqueue_add_task(ft->pt, ft->timeout_ms);
+    pollqueue_unref(&pq);
+}
+
+int
+pollqueue_finish_timeout(struct pollqueue **const ppq, int timeout_ms)
 {
     struct pollqueue * pq = *ppq;
     pthread_t worker;
+    struct finish_timeout_ss ft;
+    int rv;
 
     if (!pq)
-        return;
+        return 0;
 
-    pq->join_req = true;
+    ft.timed_out = false;
+    ft.timeout_ms = timeout_ms;
+    ft.pq = pq;
+    ft.pt = polltask_new2(pq, -1, 0, finish_timeout_cb2, &ft,
+                          POLLTASK_FLAG_ONCE | POLLTASK_FLAG_NO_REF);
+    if (ft.pt == NULL)
+        return -ENOMEM;
+
+    sem_init(&ft.sem, 0, 0);
+
     worker = pq->worker;
 
-    pollqueue_unref(&pq);
+    // Kick execution into poll thread as otherwise there are races
+    // between the execution of _cb2 and the unref
+    if ((rv = pollqueue_callback_once(pq, finish_timeout_cb1, &ft)) != 0)
+    {
+        polltask_delete(&ft.pt);
+        sem_destroy(&ft.sem);
+        return rv;
+    }
+
+    while (sem_wait(&ft.sem) == -1 && errno == EINTR)
+        /* loop */;
+    sem_destroy(&ft.sem);
+
+    if (ft.timed_out)
+        return 1;
 
     pthread_join(worker, NULL);
 
     // Delay zapping the ref until after the join as it is legit for the
     // remaining active polltasks to use it.
     *ppq = NULL;
+    return 0;
 }
+
+void
+pollqueue_finish(struct pollqueue **const ppq)
+{
+    // Whilst it is possible to write a simpler non-timeout version
+    // of the finish code it is a better idea to keep the code common
+    // given that performance is not important.
+    pollqueue_finish_timeout(ppq, -1);
+}
+
+//----------------------------------------------------------------------------
 
 void pollqueue_set_pre_post(struct pollqueue *const pq,
                             void (*fn_pre)(void *v, struct pollfd *pfd),
